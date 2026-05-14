@@ -1,61 +1,89 @@
-# Cache Management
+# Cache management
 
 ## Overview
-The Cache Management feature provides runtime cache handling for the system. It is invoked through the `CacheApi` entry point, which is the public interface used by callers that need cached data. The feature is responsible for returning cached values when they exist and for updating or invalidating those values when the underlying data changes. Because no source files are available, the exact implementation details, data structures, and side‑effects are not observable.
+The cache‑management feature sets up and controls an Infinispan‑based cache that stores static content, product data and configuration values to speed up read operations. It is triggered when a concrete cache manager implementation calls the protected `init(..)` method of `CacheManagerImpl`. The code creates a persistent, non‑passivating cache, wraps it in a `TreeCache` for hierarchical access, starts the cache and logs that the CMS cache is ready.
 
 ## Behavior
-- The system exposes a `CacheApi` that clients call to request cached data. *(source not available – citation not possible)*
-- When a request arrives, the code checks whether a corresponding entry exists in the cache. *(source not available)*
-- If a cache entry is present, the cached value is returned to the caller. *(source not available)*
-- If the entry is missing or stale, the code fetches the fresh value from the primary data store, stores it in the cache, and returns it. *(source not available)*
-- When the primary data store signals a change (e.g., via an event or direct update), the cache entry for the affected key is invalidated so subsequent reads will retrieve fresh data. *(source not available)*
+- **Trigger** – A concrete subclass (e.g., a bean that implements `CMSManager`) invokes `CacheManagerImpl.init(namedCache, locationFolder)` `CacheManagerImpl.java:17‑18`.  
+- **Input handling** – The method receives a cache name (`namedCache`) and a file‑system folder (`locationFolder`). It stores the folder in the instance field `location` `CacheManagerImpl.java:19`. No further validation is performed.  
+- **Vendor cache manager lookup** – Calls `VendorCacheManager.getInstance()` `CacheManagerImpl.java:21`. If the returned manager is `null`, an error is logged and the method returns early `CacheManagerImpl.java:22‑25`.  
+- **Configuration building** – Constructs an Infinispan `Configuration` with:
+  - persistence, no passivation,
+  - a single‑file store located at `location`,
+  - async writes, no preload, not shared,
+  - invocation‑batching enabled `CacheManagerImpl.java:38‑45`.  
+- **Define cache** – Registers the configuration under `namedCache` with the underlying `EmbeddedCacheManager` `CacheManagerImpl.java:46`.  
+- **Cache acquisition** – Retrieves the cache instance `Cache<String,String>` from the manager `CacheManagerImpl.java:47`.  
+- **TreeCache creation** – Instantiates a `TreeCacheFactory`, creates a `TreeCache` that wraps the raw cache, and stores it in the field `treeCache` `CacheManagerImpl.java:48‑49`.  
+- **Cache start** – Calls `cache.start()` to activate the cache `CacheManagerImpl.java:50`.  
+- **Side‑effect** – Logs a debug message “CMS started” `CacheManagerImpl.java:51`.  
+- **Error handling** – Any exception thrown during the above steps is caught, logged as an error, and the method exits `CacheManagerImpl.java:52‑54`.  
+
+**Local cache manager** (`LocalCacheManagerImpl`) simply stores a root file‑system path supplied via its constructor `LocalCacheManagerImpl.java:10‑12` and returns it via `getRootName()` `LocalCacheManagerImpl.java:14‑16`. `getLocation()` always returns an empty string `LocalCacheManagerImpl.java:18‑20`.
+
+**S3 cache manager** (`S3CacheManagerImpl`) stores an S3 bucket name and AWS region supplied via its constructor `S3CacheManagerImpl.java:12‑15`. `getRootName()` returns the bucket name `S3CacheManagerImpl.java:16‑18`; `getLocation()` returns the region `S3CacheManagerImpl.java:20‑22`. Accessor methods expose both values `S3CacheManagerImpl.java:24‑29`.
 
 ## Triggers / Entry points
-- **API call** to `CacheApi` (e.g., HTTP endpoint, RPC method). The exact route or method signature is not visible in the provided sources. *(source not available)*
+- `CacheManagerImpl.init(String namedCache, String locationFolder)` – called by any concrete cache manager during startup `CacheManagerImpl.java:17‑18`.  
+- `new LocalCacheManagerImpl(String rootName)` – constructs a local‑filesystem cache manager `LocalCacheManagerImpl.java:10`.  
+- `new S3CacheManagerImpl(String bucketName, String regionName)` – constructs an S3‑backed cache manager `S3CacheManagerImpl.java:12`.  
 
-## End-to-end flow (Mermaid)
+## End-to‑end flow (Mermaid)
+
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant CacheApi
-    participant DataStore
-    Client->>CacheApi: Request data
-    CacheApi->>CacheApi: Check cache
-    alt Cache hit
-        CacheApi->>Client: Return cached data
-    else Cache miss
-        CacheApi->>DataStore: Fetch fresh data
-        DataStore->>CacheApi: Return data
-        CacheApi->>CacheApi: Store in cache
-        CacheApi->>Client: Return fresh data
+    participant Caller as "Concrete CMSManager"
+    participant CacheMgr as "CacheManagerImpl"
+    participant VendorMgr as "VendorCacheManager"
+    participant InfinispanMgr as "EmbeddedCacheManager (Infinispan)"
+    participant Cache as "Cache<String,String>"
+    participant TreeCache as "TreeCache"
+    participant Logger as "SLF4J Logger"
+
+    Caller->>CacheMgr: init(namedCache, locationFolder)
+    CacheMgr->>VendorMgr: getInstance()
+    alt VendorMgr is null
+        VendorMgr-->>CacheMgr: null
+        CacheMgr->>Logger: error("CacheManager is null")
+    else
+        VendorMgr-->>CacheMgr: manager
+        CacheMgr->>InfinispanMgr: defineConfiguration(namedCache, config)
+        CacheMgr->>InfinispanMgr: getCache(namedCache)
+        InfinispanMgr-->>CacheMgr: Cache instance
+        CacheMgr->>TreeCacheFactory: new TreeCacheFactory()
+        TreeCacheFactory-->>CacheMgr: factory
+        CacheMgr->>TreeCacheFactory: createTreeCache(Cache)
+        TreeCacheFactory-->>CacheMgr: TreeCache
+        CacheMgr->>Cache: start()
+        CacheMgr->>Logger: debug("CMS started")
     end
-    Note right of DataStore: Data change event (if any) triggers cache invalidation
 ```
 
 ## State / data touched
-- **Cache store** (in‑memory, Redis, Memcached, etc.) – used for reading and writing cached entries. *(source not available)*
-- **Primary data store** (database, service, etc.) – read when a cache miss occurs. *(source not available)*
+- **Infinispan cache store** – a persistent single‑file store located at the path supplied via `locationFolder` (`CacheManagerImpl.java:42`).  
+- **`TreeCache` instance** – kept in the field `treeCache` for later hierarchical access (`CacheManagerImpl.java:15‑49`).  
+- **`SystemConfiguration` entity** – defined in the model but not accessed directly by the cache code; it holds configuration key/value pairs (`SystemConfiguration.java:32‑35`).  
 
 ## External dependencies
-- The cache backend (e.g., Redis, Memcached) that the `CacheApi` interacts with. *(source not available)*
-- The primary data store that supplies fresh values on cache miss. *(source not available)*
+- **Infinispan library** – classes `Cache`, `ConfigurationBuilder`, `TreeCache`, `TreeCacheFactory` (`CacheManagerImpl.java:2‑7`).  
+- **VendorCacheManager** – a singleton wrapper around the Infinispan `EmbeddedCacheManager` (`CacheManagerImpl.java:21`).  
+- **SLF4J Logger** – used for error and debug logging (`CacheManagerImpl.java:8‑9, 23, 51, 53`).  
+- **AWS S3** – referenced only by the `S3CacheManagerImpl` class as a conceptual storage target (`S3CacheManagerImpl.java:1‑8`). No runtime call to the AWS SDK is present.  
 
 ## Configuration / parameters
-- Any environment variables, feature flags, or configuration keys that control cache TTL, size limits, or backend connection details are not observable in the supplied sources. *(source not available)*
+- `namedCache` – the logical name of the cache to create (passed to `init`).  
+- `locationFolder` – file‑system directory used for the persistent store (`CacheManagerImpl.java:19‑42`).  
+- Infinispan persistence options (passivation disabled, async writes enabled, etc.) are hard‑coded in the `ConfigurationBuilder` chain (`CacheManagerImpl.java:38‑45`).  
+- `SystemConfiguration` fields (`key`, `value`) exist for generic system settings but are not wired into the cache initialization (`SystemConfiguration.java:32‑35`).  
 
 ## Edge cases & failure modes (observed in code)
-- **Cache miss** handling – the system falls back to the primary data store. *(source not available)*
-- **Cache invalidation** – triggered when underlying data changes. *(source not available)*
-- **Error propagation** – if the primary data store fails, the `CacheApi` propagates the error to the caller. *(source not available)*
-- No explicit retry, timeout, or rate‑limit logic can be confirmed without source code. *(source not available)*
+- **Missing VendorCacheManager** – if `VendorCacheManager.getInstance()` returns `null`, an error is logged and initialization aborts (`CacheManagerImpl.java:22‑25`).  
+- **Runtime exceptions** – any exception during configuration, cache creation or start is caught, logged as an error, and the method exits (`CacheManagerImpl.java:52‑54`).  
+- No explicit retry or fallback logic is present.  
 
 ## Open questions
-- What concrete cache backend is used and how is it instantiated?  
-- Which specific routes, HTTP methods, or RPC signatures expose `CacheApi`?  
-- What are the exact cache key generation rules and TTL values?  
-- How does the system receive notifications of data changes (e.g., events, hooks, polling)?  
-- Are there any metrics or logging statements that record cache hits/misses?  
-- Are there configuration files or environment variables that control cache size, eviction policy, or backend connection details?  
-- Does the implementation include any retry or circuit‑breaker logic for backend failures?  
+- **How is `SystemConfiguration` used to influence cache behavior?** The cache manager does not read any `SystemConfiguration` entries, yet the model exists in the same module. The linkage (e.g., reading a config key for `namedCache` or `locationFolder`) is not visible in the provided source.  
+- **Lifecycle of `LocalCacheManagerImpl` and `S3CacheManagerImpl`.** Both classes implement `CMSManager` but contain only accessor methods; the code that selects one implementation, injects it, or uses the returned root name/location is not present in the supplied files.  
+- **VendorCacheManager implementation.** The source for `VendorCacheManager` is missing, so details about how the underlying `EmbeddedCacheManager` is created, configured, or shared across the application are unknown.  
 
-*Because no readable source files were provided, the documentation above is limited to high‑level observations derived from the feature description and entry point name. All detailed claims are marked as “source not available” to comply with the requirement to ground statements in actual code.*
+---

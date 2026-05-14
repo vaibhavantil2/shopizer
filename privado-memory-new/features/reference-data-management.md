@@ -1,42 +1,111 @@
-# Reference Data Management
+# Reference data management
 
 ## Overview
-The repository contains a feature named **Reference Data Management** that is intended to provide reference data such as countries, currencies, and languages. The only concrete artifact that the repository lists for this feature is an API class called `ReferencesApi` and three domain‑entity source files: `Country.java`, `Currency.java`, and `Language.java`. No readable source code is available in the provided material, so the exact runtime behavior, request/response contracts, and data transformations cannot be confirmed from the code itself.
+The reference‑data management feature stores and maintains the static lookup tables that the platform relies on – countries, currencies, geo‑zones, languages and zones.  Entity objects (`Country`, `Currency`, `GeoZone`, `Language`, `Zone`) are instantiated, persisted and linked together by the JPA/Hibernate layer.  When an entity is created or updated the corresponding row in the relational tables (`COUNTRY`, `CURRENCY`, `GEOZONE`, `LANGUAGE`, `ZONE`) is written, and relationships (e.g., a country’s zones or its geo‑zone) are materialised through foreign‑key columns.
 
 ## Behavior
-* No concrete behavior can be extracted from the source because the files `ReferencesApi`, `Country.java`, `Currency.java`, and `Language.java` are not readable in the supplied material. Consequently, there are no line‑level citations that can be provided for any operational steps.  
+- **What triggers it** – Any code path that constructs or modifies one of the reference entities and invokes the JPA `EntityManager.persist()` / `merge()` operation triggers the feature. The entities themselves are the entry points (e.g., `new Country(..)`, `new Currency(..)`, `new GeoZone(..)`, `new Language(..)`, `new Zone(..)`).  
+  *Citations*: `Country.java:1`, `Currency.java:1`, `GeoZone.java:1`, `Language.java:1`, `Zone.java:1`.
+
+- **Inputs accepted and validation applied**  
+  - `Country` – `isoCode` (must be non‑null, unique, column `COUNTRY_ISOCODE`), `supported` flag, optional `GeoZone` reference.  
+    *Citations*: `Country.java:31-38` (field definitions, `@Column(... unique=true, nullable = false)`).
+  - `Currency` – `java.util.Currency` object (non‑null, unique via column `CURRENCY_CURRENCY_CODE`), optional `supported` flag, derived `code` (set in `setCurrency`).  
+    *Citations*: `Currency.java:23-30` (field definitions, `@Column(nullable = false, unique = true)`), `Currency.java:45-49` (setter logic).
+  - `GeoZone` – `name` and `code` (both simple strings, no explicit validation).  
+    *Citations*: `GeoZone.java:31-38`.
+  - `Language` – `code` (non‑null, column `CODE`), optional `sortOrder`.  
+    *Citations*: `Language.java:31-38` (`@Column(name = "CODE", nullable = false)`).
+  - `Zone` – `code` (non‑null, unique, column `ZONE_CODE`), mandatory `country` reference (`@JoinColumn(nullable = false)`).  
+    *Citations*: `Zone.java:31-38` (field definitions, `@JoinColumn(name = "COUNTRY_ID", nullable = false)`).
+
+- **State / data it reads or changes**  
+  - Persists the entity itself to its table (`COUNTRY`, `CURRENCY`, `GEOZONE`, `LANGUAGE`, `ZONE`).  
+    *Citations*: `Country.java:10-15`, `Currency.java:10-15`, `GeoZone.java:10-15`, `Language.java:10-15`, `Zone.java:10-15`.  
+  - Updates relationship collections:  
+    - `Country.descriptions` (`Set<CountryDescription>`), `Country.zones` (`Set<Zone>`).  
+      *Citations*: `Country.java:18-23`.  
+    - `GeoZone.countries` (`List<Country>`).  
+      *Citations*: `GeoZone.java:41-45`.  
+    - `Zone.descriptions` (`List<ZoneDescription>`).  
+      *Citations*: `Zone.java:22-27`.  
+
+- **Outputs, responses, side‑effects**  
+  - After a successful JPA transaction the new or updated rows become visible to any subsequent read operation.  
+  - The `@Cacheable` annotation on each entity enables second‑level cache population (e.g., Hibernate’s L2 cache).  
+    *Citations*: `Country.java:13`, `Currency.java:13`, `Language.java:13`, `GeoZone.java:13`.  
+  - No explicit event publishing or messaging is present in the source; side‑effects are limited to DB writes and cache updates.
+
+- **Branches**  
+  - **Success path** – All required fields are present, uniqueness constraints are satisfied, JPA transaction commits, cache is refreshed.  
+  - **Validation failure** – If a required column is null or a unique constraint (e.g., `COUNTRY_ISOCODE`, `CURRENCY_CURRENCY_CODE`, `ZONE_CODE`) is violated, the underlying database throws a constraint‑violation exception, causing the transaction to roll back. The source does not contain explicit try‑catch handling; the exception propagates to the caller.  
+    *Citations*: column definitions with `unique=true` / `nullable = false` in the entity files.  
+  - **Downstream failure** – Any failure in the persistence provider (e.g., connection loss) aborts the transaction; again, the code does not contain custom retry logic.
 
 ## Triggers / Entry points
-* The only declared entry point is `ReferencesApi` (as listed in the “Entry points” array). The actual routes, HTTP methods, UI actions, CLI commands, scheduled jobs, events, or webhooks that invoke this class are not visible in the supplied source, so no citations can be given.
+| Entity | File & line where the class is declared (entry point) |
+|--------|-------------------------------------------------------|
+| Country | `./sm-core-model/src/main/java/com/salesmanager/core/model/reference/country/Country.java:1` |
+| Currency | `./sm-core-model/src/main/java/com/salesmanager/core/model/reference/currency/Currency.java:1` |
+| GeoZone | `./sm-core-model/src/main/java/com/salesmanager/core/model/reference/geozone/GeoZone.java:1` |
+| Language | `./sm-core-model/src/main/java/com/salesmanager/core/model/reference/language/Language.java:1` |
+| Zone | `./sm-core-model/src/main/java/com/salesmanager/core/model/reference/zone/Zone.java:1` |
 
-## End-to-end flow (Mermaid)
+These classes are instantiated by higher‑level services or UI controllers (not present in the supplied sources) and then persisted via JPA.
+
+## End‑to‑end flow (Mermaid)
+
 ```mermaid
 sequenceDiagram
-    participant Client
-    participant ReferencesApi
-    Note over Client,ReferencesApi: No source available to describe the exact
-    Note over ReferencesApi: request/response sequence or internal calls.
+    participant Caller as "Service / UI"
+    participant Entity as "Reference Entity (Country/Currency/GeoZone/Language/Zone)"
+    participant JPA as "EntityManager (Hibernate)"
+    participant DB as "Relational DB"
+    participant Cache as "Second‑Level Cache"
+
+    Caller->>Entity: new Entity(...)/setters
+    Entity->>JPA: persist() / merge()
+    JPA->>DB: INSERT / UPDATE (tables COUNTRY, CURRENCY, GEOZONE, LANGUAGE, ZONE)
+    DB-->>JPA: PK generated (TABLE_GEN)
+    JPA->>Cache: put entity in L2 cache (because @Cacheable)
+    JPA-->>Caller: transaction commit (or exception)
+
+    alt Validation error (null required / duplicate)
+        DB-->>JPA: ConstraintViolationException
+        JPA-->>Caller: exception (transaction rolled back)
+    end
 ```
 
 ## State / data touched
-* The feature references three domain entities (`Country`, `Currency`, `Language`). Without source code we cannot determine which tables, collections, caches, or files are read or written, nor can we locate the corresponding data‑access code.
+| Table / Cache | Access type | Source citation |
+|---------------|-------------|-----------------|
+| `COUNTRY` | INSERT / UPDATE / SELECT | `Country.java:10-15` |
+| `CURRENCY` | INSERT / UPDATE / SELECT | `Currency.java:10-15` |
+| `GEOZONE` | INSERT / UPDATE / SELECT | `GeoZone.java:10-15` |
+| `LANGUAGE` | INSERT / UPDATE / SELECT | `Language.java:10-15` |
+| `ZONE` | INSERT / UPDATE / SELECT | `Zone.java:10-15` |
+| Hibernate L2 cache (enabled by `@Cacheable`) | read/write | `Country.java:13`, `Currency.java:13`, `GeoZone.java:13`, `Language.java:13`, `Zone.java:13` |
 
 ## External dependencies
-* No external API calls, internal services, message queues, or caches are observable in the provided files. Therefore no external dependency can be cited.
+The reference‑data code does **not** invoke external services, REST APIs, message brokers, or third‑party libraries beyond standard JPA/Hibernate and Jackson for JSON handling. No external call sites are present in the supplied files.
 
 ## Configuration / parameters
-* No configuration keys, environment variables, feature flags, or constant values are visible in the supplied material that influence this feature.
+No explicit configuration keys, environment variables, or feature flags are referenced in the entity classes. The only configurable aspects are the JPA `TABLE_GENERATOR` settings (sequence table `SM_SEQUENCER`) which are defined in each entity:
+
+- `TABLE_GEN` definition in each entity (e.g., `Country.java:20-23`, `Currency.java:20-23`, `GeoZone.java:20-23`, `Language.java:20-24`, `Zone.java:20-23`).
 
 ## Edge cases & failure modes (observed in code)
-* Because the implementation details are unavailable, no validation logic, retry mechanisms, timeout handling, rate‑limit enforcement, idempotency handling, or partial‑failure strategies can be identified.
+- **Uniqueness constraints** – `COUNTRY_ISOCODE` (Country), `CURRENCY_CURRENCY_CODE` (Currency), `ZONE_CODE` (Zone), `CODE` (Language) are declared `unique=true`. Violations raise DB exceptions.  
+  *Citations*: `Country.java:34-36`, `Currency.java:23-26`, `Zone.java:34-36`, `Language.java:31-33`.
+- **Non‑null foreign keys** – `Zone.country` is `nullable = false`; persisting a `Zone` without a `Country` causes a DB constraint error.  
+  *Citation*: `Zone.java:38-40`.
+- **Cacheability** – `@Cacheable` may cause stale reads if the cache is not evicted after external updates (not handled in code).  
+  *Citation*: `Country.java:13`, `Currency.java:13`, `Language.java:13`, `GeoZone.java:13`, `Zone.java:13`.
 
 ## Open questions
-* **Implementation details** – What methods does `ReferencesApi` expose (e.g., HTTP endpoints, RPC methods)? What are their signatures and return types?  
-* **Data access** – How are `Country`, `Currency`, and `Language` persisted? Which databases or caches are used, and what schema or collection names are involved?  
-* **Business logic** – Are there any filtering, sorting, localization, or enrichment steps applied to the reference data before it is returned?  
-* **Security & authentication** – How is access to `ReferencesApi` protected (e.g., authentication, authorization checks)?  
-* **Error handling** – What exceptions are caught, and how are error responses constructed for callers?  
-* **Configuration** – Are there any feature flags or environment variables that enable/disable parts of this feature?  
-* **External integrations** – Does the feature call external services (e.g., ISO code services) to populate or validate reference data?  
-
-*Because the source files are not readable, all the above points remain unanswered until the actual code can be inspected.*
+- **Description entities** – `CountryDescription`, `GeoZoneDescription`, and `ZoneDescription` are referenced as collections but their classes and usage (e.g., how descriptions are populated, localized, or persisted) are not present in the provided sources.  
+  *File & line*: `Country.java:18-23`, `GeoZone.java:41-45`, `Zone.java:22-27`.
+- **Audit handling for Language** – `Language` implements `Auditable` and contains an `AuditSection` field, but the code that writes audit information (e.g., timestamps, user IDs) is not shown. The `AuditListener` class is referenced but not included.  
+  *File & line*: `Language.java:20-25`.
+- **Service / controller layer** – The actual callers that instantiate these entities (REST controllers, admin UI actions, batch jobs) are not part of the supplied repository, so the exact request‑or‑event triggers cannot be pinpointed beyond the entity constructors.  
+  *File*: all entity files listed above.

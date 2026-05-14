@@ -1,65 +1,84 @@
-# Email and Notification Management
+# Email and notification management
 
 ## Overview
-The Email and Notification Management feature provides the ability to send email messages and notifications from the application. It is invoked by code that instantiates or references one of the three concrete sender classes – `HtmlEmailSender`, `SESEmailSenderImpl`, or `DefaultEmailSenderImpl` – which are defined in the `EmailSender.java` source file. The feature produces outbound email traffic (plain‑text or HTML) that is delivered to the intended recipients via the underlying transport mechanism implemented by each sender class【EmailSender.java:0】.
+The email and notification management feature sends transactional emails (e.g., order confirmations, password‑reset messages) and system notifications to users and merchants.  
+When a component in the application creates an `Email` object and calls `EmailModule.send(email)`, the call is dispatched to one of the two concrete implementations of `EmailModule` – `SESEmailSenderImpl` (which uses Amazon SES) or `DefaultEmailSenderImpl` (which uses JavaMail). The selected implementation renders the email body from a FreeMarker template and delivers the message to the external mail service.
 
 ## Behavior
-- **HtmlEmailSender** – When an instance of `HtmlEmailSender` is used, the code constructs an email with an HTML body and forwards it to the underlying email‑sending implementation defined in the same source file【EmailSender.java:0】.  
-- **SESEmailSenderImpl** – When an instance of `SESEmailSenderImpl` is used, the code prepares the email payload and invokes the Amazon Simple Email Service (SES) client to deliver the message【EmailSender.java:0】.  
-- **DefaultEmailSenderImpl** – When an instance of `DefaultEmailSenderImpl` is used, the code falls back to a default sending strategy (e.g., SMTP) defined in the same source file【EmailSender.java:0】.  
-
-*No additional business logic, templating, or notification routing can be confirmed because the source of `EmailSender.java` is not available for inspection.*
+- **Trigger** – A call to `EmailModule.send(email)` invokes the concrete sender (`SESEmailSenderImpl.send` or `DefaultEmailSenderImpl.send`). `EmailModule` defines the method at `./sm-core/src/main/java/com/salesmanager/core/business/modules/email/EmailModule.java:5`.  
+- **Input validation** – `SESEmailSenderImpl` validates that the AWS region property is not null (`Validate.notNull(region, …)` at `./sm-core/src/main/java/com/salesmanager/core/business/modules/email/SESEmailSenderImpl.java:58`). `DefaultEmailSenderImpl` checks whether an `EmailConfig` object is present before applying SMTP settings (`if (emailConfig != null)` at `./sm-core/src/main/java/com/salesmanager/core/business/modules/email/DefaultEmailSenderImpl.java:58`).  
+- **Template rendering** – Both senders load a FreeMarker template from `templates/email/<templateName>` (`freemarkerMailConfiguration.getTemplate(...)` at `SESEmailSenderImpl.java:78‑79` and `DefaultEmailSenderImpl.java:86‑87`). The template is processed with the map of tokens supplied in the `Email` object (`htmlTemplate.process(email.getTemplateTokens(), …)` at `SESEmailSenderImpl.java:82` and `textTemplate.process(templateTokens, …)` / `htmlTemplate.process(templateTokens, …)` at `DefaultEmailSenderImpl.java:89` and `109`).  
+- **Email construction**  
+  * **SES path** – Builds a `SendEmailRequest` containing destination, subject, HTML body (generated above) and a plain‑text fallback (`TEXTBODY` constant at `SESEmailSenderImpl.java:49`). The request is sent with `client.sendEmail(request)` (`SESEmailSenderImpl.java:71`).  
+  * **JavaMail path** – Creates a multipart/alternative message: a plain‑text part (`textPart`) and an HTML part (`htmlPart` inside a `MimeMultipart("related")`). The parts are attached to a `MimeMessage` (`mimeMessage.setContent(mp)` at `DefaultEmailSenderImpl.java:126`). The message is finally sent with `mailSender.send(preparator)` (`DefaultEmailSenderImpl.java:137`).  
+- **State changes** – The only state touched inside the senders is the optional `EmailConfig` object, which may be populated from the database and applied to the `JavaMailSenderImpl` (`impl.setProtocol(...)` etc. at `DefaultEmailSenderImpl.java:59‑68`). No persistent entities are modified by the senders themselves.  
+- **Success path** – If template processing succeeds and the external mail service accepts the request, the email is dispatched and the method returns normally.  
+- **Failure paths**  
+  * Missing AWS region → `Validate.notNull` throws an exception (`SESEmailSenderImpl.java:58`).  
+  * FreeMarker processing error → `MailPreparationException` is thrown (`SESEmailSenderImpl.java:84` and `DefaultEmailSenderImpl.java:89` / `109`).  
+  * Any exception from the external mail client (SES or JavaMail) propagates upward because the `send` method declares `throws Exception`.  
 
 ## Triggers / Entry points
-- Direct instantiation or injection of `HtmlEmailSender` in application code triggers HTML email sending【EmailSender.java:0】.  
-- Direct instantiation or injection of `SESEmailSenderImpl` triggers SES‑based email sending【EmailSender.java:0】.  
-- Direct instantiation or injection of `DefaultEmailSenderImpl` triggers the default email‑sending path【EmailSender.java:0】.  
+| Entry point | Description |
+|------------|-------------|
+| `./sm-core/src/main/java/com/salesmanager/core/business/modules/email/EmailModule.java:5` | Interface method `send(Email)` that any caller invokes. |
+| `./sm-core/src/main/java/com/salesmanager/core/business/modules/email/SESEmailSenderImpl.java:54` | Concrete SES implementation of `send`. |
+| `./sm-core/src/main/java/com/salesmanager/core/business/modules/email/DefaultEmailSenderImpl.java:44` | Concrete JavaMail implementation of `send`. |
 
-*No explicit routes, UI actions, CLI commands, scheduled jobs, or external events are visible in the available source.*
+## End‑to‑end flow (Mermaid)
 
-## End-to-end flow (Mermaid)
 ```mermaid
 sequenceDiagram
-    participant Caller as "Application code"
-    participant HtmlSender as "HtmlEmailSender"
-    participant SESsender as "SESEmailSenderImpl"
-    participant DefaultSender as "DefaultEmailSenderImpl"
-    participant Transport as "Underlying transport (SMTP/SES)"
+    participant Caller as "Calling component"
+    participant EmailModule as "EmailModule (interface)"
+    participant SESImpl as "SESEmailSenderImpl"
+    participant JavaMailImpl as "DefaultEmailSenderImpl"
+    participant FreeMarker as "FreeMarker engine"
+    participant SES as "Amazon SES"
+    participant JavaMail as "JavaMail (SMTP server)"
 
-    Caller->>HtmlSender: requestSendHtmlEmail()
-    HtmlSender->>Transport: sendHtmlMessage()
-    Transport-->>HtmlSender: result
-
-    Caller->>SESsender: requestSendSESEmail()
-    SESsender->>Transport: sendViaSES()
-    Transport-->>SESsender: result
-
-    Caller->>DefaultSender: requestSendDefaultEmail()
-    DefaultSender->>Transport: sendDefaultMessage()
-    Transport-->>DefaultSender: result
+    Caller->>EmailModule: send(email)
+    alt SES implementation selected
+        EmailModule->>SESImpl: send(email)
+        SESImpl->>FreeMarker: load & process template → htmlBody
+        FreeMarker-->>SESImpl: html string
+        SESImpl->>SES: SendEmailRequest (to, from, subject, htmlBody, TEXTBODY)
+        SES-->>SESImpl: 200 OK / exception
+    else JavaMail implementation selected
+        EmailModule->>JavaMailImpl: send(email)
+        JavaMailImpl->>FreeMarker: load & process template → textBody
+        FreeMarker-->>JavaMailImpl: text string
+        JavaMailImpl->>FreeMarker: load & process template → htmlBody
+        FreeMarker-->>JavaMailImpl: html string
+        JavaMailImpl->>JavaMail: SMTP send (multipart message)
+        JavaMail-->>JavaMailImpl: ACK / exception
+    end
+    SESImpl-->>Caller: return (or throw)
+    JavaMailImpl-->>Caller: return (or throw)
 ```
-*The diagram reflects the only relationships that can be inferred from the class names; concrete method names and internal calls are not observable in the provided source.*
 
 ## State / data touched
-- No database tables, collections, caches, or files are referenced in the visible source. The feature appears to operate solely on in‑memory email objects and external transport APIs【EmailSender.java:0】.
+- `SystemNotification` entity (`./sm-core-model/src/main/java/com/salesmanager/core/model/system/SystemNotification.java:1‑84`) – represents stored system notifications, but **is not accessed** by the email sender code shown.  
+- `EmailConfig` (referenced in `DefaultEmailSenderImpl.java:39‑68`) – holds SMTP configuration that may be read from the database and applied at runtime.  
+- FreeMarker template files under `templates/email/` – read from the classpath when rendering email bodies (`SESEmailSenderImpl.java:78‑79` and `DefaultEmailSenderImpl.java:86‑87`).  
 
 ## External dependencies
-- **Amazon SES client** – referenced by `SESEmailSenderImpl` as the external service used for sending mail【EmailSender.java:0】.  
-- **SMTP client / other mail transport** – implied by `DefaultEmailSenderImpl` as the fallback transport, though the exact library is not visible【EmailSender.java:0】.
+- **Amazon SES SDK** – `AmazonSimpleEmailServiceClientBuilder` and `SendEmailRequest` used in `SESEmailSenderImpl.java:60‑71`.  
+- **JavaMail / Spring Mail** – `JavaMailSender`, `JavaMailSenderImpl`, `MimeMessagePreparator` used in `DefaultEmailSenderImpl.java:27‑137`.  
+- **FreeMarker** – template engine (`freemarker.template.Configuration`, `Template`) used in both senders (`SESEmailSenderImpl.java:77‑82`, `DefaultEmailSenderImpl.java:85‑109`).  
 
 ## Configuration / parameters
-- The source file likely reads configuration values such as SMTP host, port, credentials, or AWS access keys, but no concrete configuration keys or defaults can be extracted from the unavailable code【EmailSender.java:0】.
+- `config.emailSender.region` (Spring `@Value` injection) – determines the AWS region for SES (`SESEmailSenderImpl.java:15`).  
+- `EmailConfig` fields (`protocol`, `host`, `port`, `username`, `password`, `smtpAuth`, `starttls`) – applied to the JavaMail sender when present (`DefaultEmailSenderImpl.java:59‑68`).  
+- FreeMarker template base path – constant `TEMPLATE_PATH = "templates/email"` in both implementations (`SESEmailSenderImpl.java:40`, `DefaultEmailSenderImpl.java:41`).  
 
 ## Edge cases & failure modes (observed in code)
-- The code base may contain validation of email addresses, retry logic, or error handling, but none of these mechanisms are observable in the supplied source material【EmailSender.java:0】.
+- **Missing AWS region** → `Validate.notNull` throws `IllegalArgumentException` (`SESEmailSenderImpl.java:58`).  
+- **FreeMarker template not found or processing error** → `MailPreparationException` is thrown (`SESEmailSenderImpl.java:84`, `DefaultEmailSenderImpl.java:89` / `109`).  
+- **SMTP configuration absent** – if `emailConfig` is `null`, the default `JavaMailSender` configuration (as defined elsewhere in the Spring context) is used; no explicit error is raised.  
+- **External service errors** – any exception from `client.sendEmail(request)` (SES) or `mailSender.send(preparator)` (SMTP) propagates because the `send` method declares `throws Exception`. No retry logic is present in the shown code.  
 
 ## Open questions
-- **Method signatures and implementations** – What are the exact public methods on each sender class, and how do they construct the email payload?  
-- **Templating** – Does the system use a template engine to render HTML emails, and where are templates stored?  
-- **Transport details** – Which libraries or SDKs are used for SMTP and SES communication, and how are they configured?  
-- **Error handling** – How does each sender react to transport failures (e.g., retries, back‑off, logging)?  
-- **Invocation context** – Which higher‑level services or controllers create and use these sender instances?  
-- **Notification integration** – Besides email, does the feature also push notifications to other channels (e.g., push, SMS), and if so, where is that logic located?  
-- **Configuration source** – Are configuration values read from environment variables, property files, or a configuration service?  
-
-*These questions remain unanswered because the full contents of `EmailSender.java` and any related classes are not available for analysis.*
+- **`SESEmailSenderImpl.setEmailConfig`** is declared but contains only a TODO comment (`SESEmailSenderImpl.java:93`). It is unclear whether SES can be re‑configured at runtime and, if so, how the configuration would be applied.  
+- **Structure of the `Email` class** – the source for `Email` (methods like `getFrom()`, `getFromEmail()`, `getTo()`, `getSubject()`, `getTemplateName()`, `getTemplateTokens()`) is not included, so the exact data types and any additional validation performed there are unknown.  
+- **Selection logic between SES and JavaMail** – the code shows two implementations but does not reveal how the application decides which bean to inject or invoke for a given email. This wiring likely resides in Spring configuration that is not part of the provided files.
